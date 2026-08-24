@@ -52,6 +52,7 @@
 ---@field message fun(self: GitTarget): string
 ---@field author fun(self: GitTarget): string
 ---@field parent fun(self: GitTarget): GitTarget?
+---@field before fun(self: GitTarget, days: number): GitTarget?
 
 ---@alias CommitHook fun(target: GitTarget, plugin: LazyPlugin): (string | GitTarget)
 

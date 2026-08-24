@@ -412,4 +412,139 @@ function M.age(repo, commit)
   return lines[1] or ""
 end
 
+---@param repo string
+---@param ancestor string commit SHA that should be the ancestor
+---@param descendant string commit SHA that should be the descendant
+---@return boolean true if `ancestor` is an ancestor of `descendant`
+function M.is_ancestor(repo, ancestor, descendant)
+  local ok, code = pcall(function()
+    local _, c = Process.exec({ "git", "merge-base", "--is-ancestor", ancestor, descendant }, { cwd = repo })
+    return c
+  end)
+  return ok and code == 0
+end
+
+M.hooks = {}
+
+local DAY_SECONDS = 86400
+local DAY_UNITS = { s = 1 / DAY_SECONDS, m = 60 / DAY_SECONDS, h = 3600 / DAY_SECONDS, d = 1, w = 7, y = 365 }
+
+--- Parses a duration into a (possibly fractional) number of days.
+--- Accepts a positive number (days) or a single-unit string like "30m",
+--- "24h", "7d", "2w", "1y". Returns nil for nil/false/invalid input.
+---@param value string|number|false|nil
+---@return number?
+function M.hooks.parse_days(value)
+  if value == nil or value == false then
+    return nil
+  end
+  if type(value) == "number" then
+    return value > 0 and value or nil
+  end
+  if type(value) == "string" then
+    local n, unit = value:match("^(%d+)%s*([smhdwy])$")
+    if n and unit then
+      local days = tonumber(n) * DAY_UNITS[unit]
+      return days > 0 and days or nil
+    end
+  end
+  return nil
+end
+
+--- Finds the newest tag, among those matching the plugin's version range,
+--- whose creation date is at least `days` old. Mirrors get_target's own
+--- tag/version resolution so a hook can stay on a real tagged release
+--- instead of landing on an arbitrary untagged ancestor commit.
+---@param plugin LazyPlugin
+---@param days number
+---@return GitTarget?
+function M.hooks._mature_tag(plugin, days)
+  local cutoff = os.time() - days * DAY_SECONDS
+  local version = (plugin.version == nil and plugin.branch == nil) and Config.options.defaults.version or plugin.version
+  local versions = M.get_versions(plugin.dir, version)
+  if #versions == 0 then
+    return nil
+  end
+  local ok, lines = pcall(function()
+    return Process.exec(
+      { "git", "for-each-ref", "--format=%(refname:strip=2) %(creatordate:unix)", "refs/tags" },
+      { cwd = plugin.dir }
+    )
+  end)
+  if not ok then
+    return nil
+  end
+  ---@type table<string, integer>
+  local tag_times = {}
+  for _, line in ipairs(lines) do
+    local tag, ts = line:match("^(.+) (%d+)$")
+    if tag then
+      tag_times[tag] = tonumber(ts)
+    end
+  end
+  local eligible = vim.tbl_filter(function(v)
+    local ts = tag_times[v.tag]
+    return ts ~= nil and ts <= cutoff
+  end, versions)
+  local last = Semver.last(eligible)
+  if not last then
+    return nil
+  end
+  local commit = M.ref(plugin.dir, "tags/" .. last.tag)
+  if not commit then
+    return nil
+  end
+  return target(plugin.dir, { branch = M.get_branch(plugin), tag = last.tag, version = last, commit = commit })
+end
+
+--- Builds a CommitHook that only accepts commits/tags at least `value` old,
+--- mitigating supply-chain attacks by giving the community time to catch a
+--- freshly published malicious update before it is adopted. Usage:
+---
+---   require("lazy").setup(spec, {
+---     defaults = { commit = require("lazy.manage.git").hooks.minimum_release_age("7d") },
+---   })
+---
+--- `value` accepts a positive number of days or a single-unit duration
+--- string ("30m", "24h", "7d", "2w", "1y").
+---
+--- Explicit `tag = "..."` pins and `pin = true` plugins are passed through
+--- unchanged -- this only constrains fuzzy resolution (semver ranges and
+--- branch HEAD following), matching Renovate's pin-exemption semantics.
+---
+--- By default, an already-installed plugin whose current commit is newer
+--- than the mature ceiling is left as-is rather than rolled back; pass
+--- `{ downgrade = true }` to always pin to the newest eligible commit,
+--- rolling back if necessary.
+---@param value string|number
+---@param opts? { downgrade?: boolean }
+---@return CommitHook
+function M.hooks.minimum_release_age(value, opts)
+  opts = opts or {}
+  local days = M.hooks.parse_days(value)
+  return function(t, plugin)
+    if not days or plugin.tag or plugin.pin then
+      return t
+    end
+
+    local mature = t.tag and M.hooks._mature_tag(plugin, days) or t:before(days)
+    if not mature then
+      -- Nothing is old enough yet; stay put until a future check finds one.
+      return t
+    end
+
+    if opts.downgrade then
+      return mature
+    end
+
+    -- Don't roll back an already-installed plugin that is already past the
+    -- mature ceiling.
+    local info = M.info(plugin.dir)
+    if info and info.commit and mature.commit and M.is_ancestor(plugin.dir, mature.commit, info.commit) then
+      return info.commit
+    end
+    return mature
+  end
+end
+
 return M
