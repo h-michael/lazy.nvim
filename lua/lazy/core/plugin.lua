@@ -330,7 +330,9 @@ function M.load()
     vim.deepcopy(Config.options.spec),
   }
   specs[#specs + 1] = M.find_local_spec()
-  specs[#specs + 1] = { "folke/lazy.nvim" }
+  -- Point the self-spec at the fork so self-update doesn't reset the
+  -- install back to upstream main while dogfooding this branch.
+  specs[#specs + 1] = { "h-michael/lazy.nvim", branch = "fix/commit-hook-improvements" }
 
   Config.spec:parse(specs)
 
