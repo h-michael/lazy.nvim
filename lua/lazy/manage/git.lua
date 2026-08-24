@@ -8,20 +8,33 @@ local M = {}
 ---@alias GitInfo {branch?:string, commit?:string, tag?:string, version?:Semver}
 
 ---@class GitTarget
+---@field _ancestors? string[] Batch-prefetched ancestor commits (self excluded), lazily filled by :parent()
 local Target = {}
 Target.__index = Target
+
+-- How many ancestor commits to fetch per `git log` call when walking parents.
+-- A single spawn amortizes across this many :parent() calls instead of one
+-- spawn per step, which matters for hooks that walk dozens/hundreds of
+-- commits (e.g. a minimum-age policy on an actively-developed branch).
+local PARENT_BATCH_SIZE = 50
 
 ---@param dir string
 ---@param info GitInfo
 ---@param commit string?
 ---@return GitTarget
 local function target(dir, info, commit)
+  -- A `tag`/`version` only describes the exact commit that tag points to.
+  -- Walking to a different commit (a different ancestor) means we're no
+  -- longer looking at that release, so drop the now-stale tag/version
+  -- metadata rather than mislabeling an unrelated commit as if it were
+  -- still that tagged version.
+  local same_commit = not commit or commit == info.commit
   return setmetatable({
     commit = commit or info.commit,
     branch = info.branch,
     dir = dir,
-    tag = info.tag,
-    version = info.version,
+    tag = same_commit and info.tag or nil,
+    version = same_commit and info.version or nil,
   }, Target)
 end
 
@@ -41,6 +54,29 @@ end
 ---@return number
 function Target:age()
   return math.floor((os.time() - self:date()) / 86400)
+end
+
+--- Returns the newest ancestor of `self` (inclusive) that is at least
+--- `days` old, in a single `git log` spawn -- unlike walking :parent()
+--- one commit at a time, this does not cost one spawn per skipped commit.
+--- Returns nil if no ancestor is old enough.
+---@param days number
+---@return GitTarget?
+function Target:before(days)
+  local cutoff = os.time() - days * 86400
+  local lines = Process.exec({
+    "git",
+    "log",
+    "-1",
+    "--format=%H",
+    "--before=@" .. cutoff,
+    self.commit,
+  }, { cwd = self.dir })
+  local commit = lines[1]
+  if commit and commit ~= "" then
+    return target(self.dir, self, commit)
+  end
+  return nil
 end
 
 ---@return string
@@ -72,21 +108,45 @@ function Target:author()
   return lines[1] or ""
 end
 
+--- Returns the direct parent as a new GitTarget, or nil if `self` is the
+--- root commit. Calling this repeatedly on the same GitTarget always
+--- returns an equivalent result (idempotent) -- internally it batch-fetches
+--- and caches a window of ancestor commits so that walking a long chain
+--- (e.g. a hook stepping back day by day) costs one `git log` spawn per
+--- `PARENT_BATCH_SIZE` steps instead of one spawn per step.
 ---@return GitTarget?
 function Target:parent()
-  local lines = Process.exec({
-    "git",
-    "log",
-    "--pretty=format:%H",
-    "-n",
-    "2",
-    self.commit,
-  }, { cwd = self.dir })
-  local parent = lines[2]
-  if parent and parent ~= "" then
-    return target(self.dir, self, parent)
+  local idx = (self._offset or 0) + 1
+  if not self._ancestors or idx > #self._ancestors then
+    local lines = Process.exec({
+      "git",
+      "log",
+      "--pretty=format:%H",
+      "-n",
+      tostring(PARENT_BATCH_SIZE + 1),
+      self.commit,
+    }, { cwd = self.dir })
+    ---@type string[]
+    local ancestors = {}
+    for i = 2, #lines do
+      ancestors[#ancestors + 1] = lines[i]
+    end
+    self._ancestors = ancestors
+    self._offset = 0
+    idx = 1
   end
-  return nil
+
+  local parent_sha = self._ancestors[idx]
+  if not parent_sha or parent_sha == "" then
+    return nil
+  end
+
+  local child = target(self.dir, self, parent_sha)
+  -- Share the batch and continue the offset so the child's own :parent()
+  -- calls read from the same window instead of refetching immediately.
+  child._ancestors = self._ancestors
+  child._offset = idx
+  return child
 end
 
 M.target = target
