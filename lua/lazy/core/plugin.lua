@@ -332,7 +332,7 @@ function M.load()
   specs[#specs + 1] = M.find_local_spec()
   -- Point the self-spec at the fork so self-update doesn't reset the
   -- install back to upstream main while dogfooding this branch.
-  specs[#specs + 1] = { "h-michael/lazy.nvim", branch = "fix/commit-hook-improvements" }
+  specs[#specs + 1] = { "h-michael/lazy.nvim", branch = "dogfooding/commit-hook" }
 
   Config.spec:parse(specs)
 
